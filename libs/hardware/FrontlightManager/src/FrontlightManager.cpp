@@ -13,6 +13,7 @@
 
 #include "FrontlightManager.h"
 #ifdef FREEINK_FRONTLIGHT_LS
+#include <clk_ctrl_os.h>  // periph_rtc_dig_clk8m_get_freq()
 #include <driver/ledc.h>
 // esp_sleep_sub_mode_config lives in a private IDF header (no public API exists
 // for balancing the refcounted RC_FAST keep-on the LEDC driver takes for
@@ -97,10 +98,10 @@ uint32_t physicalDuty(uint32_t logicalDuty, uint32_t full, bool activeHigh) {
 // sleep current), mark the
 // channels KEEP_ALIVE, and disable the GPIO sleep-isolation override on the
 // output pins (a documented gotcha: sleep entry reconfigures the pad and kills
-// the PWM even when the clock survives). RC_FAST at 10 kHz supports up to
-// 10-bit resolution (17.5 MHz / 10 kHz = 1750 >= 1024), so the board profiles'
-// full duty range — including setBrightnessLevel's level-1 minimum step — stays
-// expressible. Uses the IDF driver directly (fixed LEDC_TIMER_0 + the channel
+// the PWM even when the clock survives). RC_FAST drives 10-bit resolution up to
+// about 17 kHz (17.5 MHz / 1024); a faster profile frequency is lowered to fit
+// (the IDF logs one error for the first attempt), so the full duty range —
+// including setBrightnessLevel's level-1 minimum step — stays expressible. Uses the IDF driver directly (fixed LEDC_TIMER_0 + the channel
 // ids below) because the Arduino helpers don't expose sleep_mode; safe here
 // because frontlight boards using this flag have no other LEDC consumer.
 bool attachChannel(int8_t gpio, uint8_t ch, uint32_t freq, uint8_t bits) {
@@ -111,9 +112,16 @@ bool attachChannel(int8_t gpio, uint8_t ch, uint32_t freq, uint8_t bits) {
   timer.freq_hz = freq;
   timer.clk_cfg = LEDC_USE_RC_FAST_CLK;
   if (ledc_timer_config(&timer) != ESP_OK) {
-    // freq/bits exceed RC_FAST — leave the light unconfigured rather than
-    // silently falling back to a clock that freezes in light sleep.
-    return false;
+    // freq × 2^bits exceeds RC_FAST (e.g. the X4 Pro's 25 kHz at 10 bits). Keep
+    // the resolution, so the dimmest level stays fine, and lower the frequency
+    // to the highest RC_FAST can drive. The failed call already calibrated
+    // RC_FAST; this getter returns the value LEDC divides.
+    const uint32_t fit = periph_rtc_dig_clk8m_get_freq() >> bits;
+    if (fit == 0 || fit >= freq) return false;
+    timer.freq_hz = fit;
+    if (ledc_timer_config(&timer) != ESP_OK) return false;
+    LOG_INF("FrontlightMgr", "attach: %lu Hz does not fit RC_FAST at %u bits, using %lu Hz",
+            static_cast<unsigned long>(freq), bits, static_cast<unsigned long>(fit));
   }
   ledc_channel_config_t chan = {};
   chan.gpio_num = gpio;
